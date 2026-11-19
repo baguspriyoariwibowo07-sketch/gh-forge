@@ -38,13 +38,16 @@ function authorized(req: IncomingMessage): boolean {
 
 function sendJson(res: ServerResponse, requestId: string, status: number, body: unknown, extra: Readonly<Record<string, string>> = {}): void {
   const text = body === undefined || body === null ? '' : JSON.stringify(body);
+  // Encode once: Buffer.byteLength plus res.end(string) would walk and encode the
+  // string a second time on every reply.
+  const buf = text === '' ? null : Buffer.from(text, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'x-github-request-id': requestId,
-    ...(text !== '' ? { 'content-length': Buffer.byteLength(text) } : {}),
+    ...(buf !== null ? { 'content-length': buf.length } : {}),
     ...extra,
   });
-  res.end(text);
+  res.end(buf ?? undefined);
 }
 
 function sendBytes(res: ServerResponse, requestId: string, status: number, body: Buffer, contentType: string): void {

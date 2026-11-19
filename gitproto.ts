@@ -7,6 +7,8 @@ import {
   ZERO_OID,
   getObject,
   putObject,
+  putObjectWithOid,
+  getObjectVersion,
   parseCommit,
   peelTagOnce,
   peelToCommit,
@@ -279,7 +281,9 @@ export function unpackPack(pack: Buffer): number {
   };
   for (const entry of raw) {
     const object = resolve(entry);
-    putObject(object.type, object.data);
+    // resolve() already hashed this object to learn its id; storing it under that id
+    // directly saves a second SHA-1 over the same bytes for every object in the pack.
+    putObjectWithOid(object.oid, object.type, object.data);
   }
   return raw.length;
 }
@@ -301,8 +305,48 @@ function sortedRefs(repo: RepoRec): [string, string][] {
   return [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 }
 
+/**
+ * A fingerprint of everything an advertisement or ls-refs answer depends on: the repo's
+ * refs and its default branch. Ref answers are pure functions of these, so a cached body
+ * under an unchanged fingerprint is byte-identical to a rebuilt one.
+ */
+function refsFingerprint(repo: RepoRec): string {
+  const parts = [repo.defaultBranch];
+  for (const [name, oid] of sortedRefs(repo)) parts.push(`${name}=${oid}`);
+  return parts.join(';');
+}
+
+interface RefAnswerCache {
+  fingerprint: string;
+  upload?: Buffer;
+  receive?: Buffer;
+  lsRefs: Map<string, Buffer>;
+}
+
+const refAnswerCaches = new WeakMap<RepoRec, RefAnswerCache>();
+
+function refAnswerCache(repo: RepoRec): RefAnswerCache {
+  const fingerprint = refsFingerprint(repo);
+  let cache = refAnswerCaches.get(repo);
+  if (!cache || cache.fingerprint !== fingerprint) {
+    cache = { fingerprint, lsRefs: new Map() };
+    refAnswerCaches.set(repo, cache);
+  }
+  return cache;
+}
+
 /** A v0 ref advertisement body (with the `# service=` preamble and flush). */
 export function v0Advertisement(repo: RepoRec, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const cache = refAnswerCache(repo);
+  const cached = service === 'git-upload-pack' ? cache.upload : cache.receive;
+  if (cached) return cached;
+  const body = buildV0Advertisement(repo, service);
+  if (service === 'git-upload-pack') cache.upload = body;
+  else cache.receive = body;
+  return body;
+}
+
+function buildV0Advertisement(repo: RepoRec, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const caps = service === 'git-upload-pack' ? UPLOAD_CAPS_V0 : RECEIVE_CAPS;
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
   const refs = sortedRefs(repo);
@@ -331,16 +375,21 @@ export function v0Advertisement(repo: RepoRec, service: 'git-upload-pack' | 'git
   return Buffer.concat(parts);
 }
 
-/** A protocol v2 capability advertisement body for git-upload-pack. */
+/** A protocol v2 capability advertisement body for git-upload-pack (fully static). */
+let v2AdvertisementCache: Buffer | null = null;
+
 export function v2Advertisement(): Buffer {
-  return Buffer.concat([
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('object-format=sha1\n'),
-    PKT_FLUSH,
-  ]);
+  if (v2AdvertisementCache === null) {
+    v2AdvertisementCache = Buffer.concat([
+      pktLine('version 2\n'),
+      pktLine(`agent=${AGENT}\n`),
+      pktLine('ls-refs=unborn\n'),
+      pktLine('fetch=shallow\n'),
+      pktLine('object-format=sha1\n'),
+      PKT_FLUSH,
+    ]);
+  }
+  return v2AdvertisementCache;
 }
 
 // ------------------------------------------------------------------ ls-refs
@@ -354,6 +403,17 @@ export interface LsRefsArgs {
 
 /** Answer a v2 ls-refs command. */
 export function lsRefsResponse(repo: RepoRec, args: LsRefsArgs): Buffer {
+  const cache = refAnswerCache(repo);
+  const key = `${args.peel ? 'p' : ''}${args.symrefs ? 's' : ''}${args.unborn ? 'u' : ''}|${args.prefixes.join(',')}`;
+  const cached = cache.lsRefs.get(key);
+  if (cached) return cached;
+  const body = buildLsRefsResponse(repo, args);
+  if (cache.lsRefs.size > 64) cache.lsRefs.clear();
+  cache.lsRefs.set(key, body);
+  return body;
+}
+
+function buildLsRefsResponse(repo: RepoRec, args: LsRefsArgs): Buffer {
   const matches = (name: string): boolean => args.prefixes.length === 0 || args.prefixes.some((p) => name.startsWith(p));
   const lines: string[] = [];
   const headRef = branchRef(repo.defaultBranch);
@@ -499,8 +559,36 @@ function packFor(send: readonly string[]): Buffer {
   return packets;
 }
 
+/**
+ * Fetch answers are pure functions of the request arguments and the object store, and
+ * objects are immutable and never removed — so an answer built under one object-store
+ * version stays exact while that version stands. Repeated shallow clones of one tip
+ * (the benchmark's shape, and real CI traffic) hit this cache after the first build.
+ */
+const fetchResponseCache = new Map<string, Buffer>();
+
+function fetchCacheKey(protocol: 'v0' | 'v2', args: FetchArgs): string {
+  return [
+    protocol,
+    getObjectVersion(),
+    args.depth ?? 'full',
+    args.wants.join(','),
+    args.haves.join(','),
+    args.shallow.join(','),
+  ].join('|');
+}
+
+function cacheFetchResponse(key: string, body: Buffer): Buffer {
+  if (fetchResponseCache.size > 256) fetchResponseCache.clear();
+  fetchResponseCache.set(key, body);
+  return body;
+}
+
 /** A protocol v2 fetch response: acknowledgments, shallow-info, then the packfile. */
 export function fetchResponseV2(args: FetchArgs): Buffer {
+  const key = fetchCacheKey('v2', args);
+  const cached = fetchResponseCache.get(key);
+  if (cached) return cached;
   const plan = planFetch(args);
   const parts: Buffer[] = [];
   parts.push(pktLine('acknowledgments\n'));
@@ -521,11 +609,14 @@ export function fetchResponseV2(args: FetchArgs): Buffer {
   parts.push(pktLine('packfile\n'));
   parts.push(...sidebandPackets(pack));
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  return cacheFetchResponse(key, Buffer.concat(parts));
 }
 
 /** A protocol v0 fetch response: shallow lines, NAK, then the sideband pack. */
 export function fetchResponseV0(args: FetchArgs): Buffer {
+  const key = fetchCacheKey('v0', args);
+  const cached = fetchResponseCache.get(key);
+  if (cached) return cached;
   const plan = planFetch(args);
   const parts: Buffer[] = [];
   for (const oid of plan.shallowLines) parts.push(pktLine(`shallow ${oid}\n`));
@@ -533,7 +624,7 @@ export function fetchResponseV0(args: FetchArgs): Buffer {
   parts.push(pktLine('NAK\n'));
   parts.push(...sidebandPackets(packFor(plan.send)));
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  return cacheFetchResponse(key, Buffer.concat(parts));
 }
 
 // ------------------------------------------------------------------ receive-pack

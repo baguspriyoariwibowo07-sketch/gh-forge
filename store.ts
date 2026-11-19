@@ -47,6 +47,17 @@ export interface GitObject {
 /** Every object the forge holds, by id. Content-addressed, so repos safely share it. */
 export const objectStore = new Map<string, GitObject>();
 
+/**
+ * A counter that changes exactly when the object store's contents change. Objects are
+ * immutable and never removed, so a new object is the only possible change; response
+ * caches keyed on this version (see gitproto.ts) are therefore exact, never stale.
+ */
+let objectVersion = 0;
+
+export function getObjectVersion(): number {
+  return objectVersion;
+}
+
 /** SHA-1 over `<type> <size>\0` + data: the object id git assigns. */
 export function hashObject(type: GitObjectType, data: Buffer): string {
   const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
@@ -56,8 +67,19 @@ export function hashObject(type: GitObjectType, data: Buffer): string {
 /** Store an object (idempotently) and return its id. */
 export function putObject(type: GitObjectType, data: Buffer): string {
   const oid = hashObject(type, data);
-  if (!objectStore.has(oid)) objectStore.set(oid, { type, data });
+  if (!objectStore.has(oid)) {
+    objectStore.set(oid, { type, data });
+    objectVersion += 1;
+  }
   return oid;
+}
+
+/** Store an object whose id the caller has already computed (skips the second hash). */
+export function putObjectWithOid(oid: string, type: GitObjectType, data: Buffer): void {
+  if (!objectStore.has(oid)) {
+    objectStore.set(oid, { type, data });
+    objectVersion += 1;
+  }
 }
 
 export function getObject(oid: string): GitObject | undefined {
