@@ -36,6 +36,18 @@ function authorized(req: IncomingMessage): boolean {
   return header === `Bearer ${TOKEN}` || header === `token ${TOKEN}`;
 }
 
+/** GitHub-style core rate-limit headers, attached to every REST response. */
+function rateLimitHeaders(): Record<string, string> {
+  const reset = (Math.floor(Date.now() / 3_600_000) + 1) * 3600;
+  return {
+    'x-ratelimit-limit': '5000',
+    'x-ratelimit-remaining': '4999',
+    'x-ratelimit-used': '1',
+    'x-ratelimit-reset': String(reset),
+    'x-ratelimit-resource': 'core',
+  };
+}
+
 function sendJson(res: ServerResponse, requestId: string, status: number, body: unknown, extra: Readonly<Record<string, string>> = {}): void {
   const text = body === undefined || body === null ? '' : JSON.stringify(body);
   // Encode once: Buffer.byteLength plus res.end(string) would walk and encode the
@@ -136,12 +148,13 @@ function splitV2Command(body: Buffer): { command: string; args: string[] } | nul
 }
 
 function parseFetchArgs(lines: readonly string[]): FetchArgs {
-  const args: FetchArgs = { wants: [], haves: [], shallow: [], depth: null, done: false };
+  const args: FetchArgs = { wants: [], haves: [], shallow: [], depth: null, deepenRelative: false, done: false };
   for (const line of lines) {
     if (line.startsWith('want ')) args.wants.push(line.slice(5).trim());
     else if (line.startsWith('have ')) args.haves.push(line.slice(5).trim());
     else if (line.startsWith('shallow ')) args.shallow.push(line.slice(8).trim());
     else if (line.startsWith('deepen ')) args.depth = Number(line.slice(7).trim());
+    else if (line === 'deepen-relative') args.deepenRelative = true;
     else if (line === 'done') args.done = true;
   }
   return args;
@@ -198,6 +211,13 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, reque
     }
     return line;
   });
+  // In v0 the fetch capabilities ride on the first want line, space-separated;
+  // `deepen-relative` among them changes the meaning of `deepen`, so surface it
+  // as the argument line parseFetchArgs understands.
+  const firstWant = lines.find((line) => line.startsWith('want '));
+  if (firstWant !== undefined && firstWant.split(' ').includes('deepen-relative')) {
+    normalized.push('deepen-relative');
+  }
   sendBytes(res, requestId, 200, fetchResponseV0(parseFetchArgs(normalized)), 'application/x-git-upload-pack-result');
 }
 
@@ -382,11 +402,11 @@ async function route(req: IncomingMessage, res: ServerResponse, requestId: strin
       host: req.headers.host ?? 'localhost',
     });
     if (response.status === 204) {
-      res.writeHead(204, { 'content-type': JSON_TYPE, 'x-github-request-id': requestId, ...(response.headers ?? {}) });
+      res.writeHead(204, { 'content-type': JSON_TYPE, 'x-github-request-id': requestId, ...rateLimitHeaders(), ...(response.headers ?? {}) });
       res.end();
       return;
     }
-    sendJson(res, requestId, response.status, response.body ?? {}, response.headers);
+    sendJson(res, requestId, response.status, response.body ?? {}, { ...rateLimitHeaders(), ...(response.headers ?? {}) });
     return;
   }
 

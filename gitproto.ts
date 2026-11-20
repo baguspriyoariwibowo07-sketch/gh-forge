@@ -297,7 +297,7 @@ function putObjectDryRun(type: GitObjectType, data: Buffer): string {
 
 const AGENT = 'gh-forge/1.0.0';
 const UPLOAD_CAPS_V0 =
-  'multi_ack_detailed side-band-64k thin-pack ofs-delta shallow deepen-since deepen-not ' +
+  'multi_ack_detailed side-band-64k thin-pack ofs-delta shallow deepen-since deepen-not deepen-relative ' +
   `symref=HEAD:refs/heads/main agent=${AGENT} object-format=sha1`;
 const RECEIVE_CAPS = `report-status delete-refs side-band-64k ofs-delta agent=${AGENT} object-format=sha1`;
 
@@ -354,6 +354,7 @@ function buildV0Advertisement(repo: RepoRec, service: 'git-upload-pack' | 'git-r
   const headTip = repo.refs.get(headRef);
   if (refs.length === 0) {
     parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+    parts.push(PKT_FLUSH);
     return Buffer.concat(parts);
   }
   let first = true;
@@ -446,6 +447,8 @@ export interface FetchArgs {
   haves: string[];
   shallow: string[];
   depth: number | null;
+  /** `deepen-relative`: the depth counts generations below the reported shallow boundary, not from the wants. */
+  deepenRelative: boolean;
   done: boolean;
 }
 
@@ -475,34 +478,74 @@ export function planFetch(args: FetchArgs): FetchPlan {
       for (const reachable of reachableFrom([parseCommit(object.data).tree])) haveClosure.add(reachable);
     }
   }
-  // Depth-limited: walk commit generations from the wants; a commit at generation
-  // `depth` is the shallow boundary (its parents stay behind).
-  const depthOf = new Map<string, number>();
-  let frontier: string[] = [];
-  for (const want of args.wants) {
-    const commit = peelToCommit(want);
-    if (commit !== null && !depthOf.has(commit)) {
-      depthOf.set(commit, 1);
-      frontier.push(commit);
-    }
-  }
-  let generation = 1;
-  while (frontier.length > 0 && generation < args.depth) {
-    const next: string[] = [];
-    for (const oid of frontier) {
-      const object = getObject(oid);
-      if (!object || object.type !== 'commit') continue;
-      for (const parent of parseCommit(object.data).parents) {
-        if (!depthOf.has(parent)) {
-          depthOf.set(parent, generation + 1);
-          next.push(parent);
-        }
+  // Depth-limited. Two shapes, told apart by the wire: plain `deepen <n>` walks `n`
+  // generations down from the wants (a fresh shallow fetch, or an absolute deepen);
+  // `deepen <n>` with `deepen-relative` (what `git fetch --deepen` sends) keeps
+  // everything down to the reported boundary and walks `n` further generations
+  // below it.
+  const includedCommits = new Set<string>();
+  if (args.shallow.length === 0 || !args.deepenRelative) {
+    let frontier: string[] = [];
+    for (const want of args.wants) {
+      const commit = peelToCommit(want);
+      if (commit !== null && !includedCommits.has(commit)) {
+        includedCommits.add(commit);
+        frontier.push(commit);
       }
     }
-    frontier = next;
-    generation += 1;
+    let generation = 1;
+    while (frontier.length > 0 && generation < args.depth) {
+      const next: string[] = [];
+      for (const oid of frontier) {
+        const object = getObject(oid);
+        if (!object || object.type !== 'commit') continue;
+        for (const parent of parseCommit(object.data).parents) {
+          if (!includedCommits.has(parent)) {
+            includedCommits.add(parent);
+            next.push(parent);
+          }
+        }
+      }
+      frontier = next;
+      generation += 1;
+    }
+  } else {
+    const shallowSet = new Set(args.shallow);
+    // Phase A: from the wants down to (and including) the reported boundary,
+    // never crossing it.
+    const stack: string[] = [];
+    for (const want of args.wants) {
+      const commit = peelToCommit(want);
+      if (commit !== null) stack.push(commit);
+    }
+    while (stack.length > 0) {
+      const oid = stack.pop() as string;
+      if (includedCommits.has(oid)) continue;
+      includedCommits.add(oid);
+      if (shallowSet.has(oid)) continue;
+      const object = getObject(oid);
+      if (!object || object.type !== 'commit') continue;
+      for (const parent of parseCommit(object.data).parents) stack.push(parent);
+    }
+    // Phase B: from each boundary commit the client actually holds, walk `depth`
+    // further generations down.
+    let frontier = args.shallow.filter((oid) => getObject(oid)?.type === 'commit');
+    for (let step = 0; step < args.depth; step += 1) {
+      const next: string[] = [];
+      for (const oid of frontier) {
+        const object = getObject(oid);
+        if (!object || object.type !== 'commit') continue;
+        for (const parent of parseCommit(object.data).parents) {
+          if (!includedCommits.has(parent)) {
+            includedCommits.add(parent);
+            next.push(parent);
+          }
+        }
+      }
+      frontier = next;
+      if (frontier.length === 0) break;
+    }
   }
-  const includedCommits = new Set(depthOf.keys());
   const boundary = new Set<string>();
   for (const oid of includedCommits) {
     const object = getObject(oid);
@@ -572,6 +615,8 @@ function fetchCacheKey(protocol: 'v0' | 'v2', args: FetchArgs): string {
     protocol,
     getObjectVersion(),
     args.depth ?? 'full',
+    args.deepenRelative ? 'relative' : 'absolute',
+    args.done ? 'done' : 'negotiating',
     args.wants.join(','),
     args.haves.join(','),
     args.shallow.join(','),
@@ -584,21 +629,33 @@ function cacheFetchResponse(key: string, body: Buffer): Buffer {
   return body;
 }
 
-/** A protocol v2 fetch response: acknowledgments, shallow-info, then the packfile. */
+/**
+ * A protocol v2 fetch response. A request that ends in `done` is answered with the
+ * shallow-info (when the boundary moves) and the packfile directly — the protocol
+ * forbids an acknowledgments section there, and a real git client aborts with
+ * "expected 'packfile', received 'acknowledgments'" if one shows up. A negotiating
+ * request (no `done` yet) gets the acknowledgments section first.
+ */
 export function fetchResponseV2(args: FetchArgs): Buffer {
   const key = fetchCacheKey('v2', args);
   const cached = fetchResponseCache.get(key);
   if (cached) return cached;
   const plan = planFetch(args);
   const parts: Buffer[] = [];
-  parts.push(pktLine('acknowledgments\n'));
-  if (args.haves.length > 0) {
-    const common = args.haves.filter((oid) => getObject(oid));
-    parts.push(pktLine(common.length > 0 ? `ACK ${common[common.length - 1]}\n` : 'NAK\n'));
-  } else {
-    parts.push(pktLine('NAK\n'));
+  if (!args.done) {
+    parts.push(pktLine('acknowledgments\n'));
+    if (args.haves.length > 0) {
+      const common = args.haves.filter((oid) => getObject(oid));
+      parts.push(pktLine(common.length > 0 ? `ACK ${common[common.length - 1]}\n` : 'NAK\n'));
+    } else {
+      parts.push(pktLine('NAK\n'));
+    }
+    // The object store is complete and in memory, so negotiation is always finished:
+    // say `ready`. Without it a real git client aborts with "expected no other
+    // sections to be sent after no 'ready'" when the pack sections follow.
+    parts.push(pktLine('ready\n'));
+    parts.push(PKT_DELIM);
   }
-  parts.push(PKT_DELIM);
   if (plan.shallowLines.length > 0 || plan.unshallowLines.length > 0) {
     parts.push(pktLine('shallow-info\n'));
     for (const oid of plan.shallowLines) parts.push(pktLine(`shallow ${oid}\n`));
@@ -619,8 +676,21 @@ export function fetchResponseV0(args: FetchArgs): Buffer {
   if (cached) return cached;
   const plan = planFetch(args);
   const parts: Buffer[] = [];
+  // A shallow request without `done` is phase one of the v0 shallow dance: the
+  // client expects the shallow list alone (flush-terminated) and comes back with
+  // `done` for the pack. Answering with the pack here makes a real git client die
+  // with "expected shallow list".
+  if (!args.done && args.depth !== null) {
+    for (const oid of plan.shallowLines) parts.push(pktLine(`shallow ${oid}\n`));
+    for (const oid of plan.unshallowLines) parts.push(pktLine(`unshallow ${oid}\n`));
+    parts.push(PKT_FLUSH);
+    return cacheFetchResponse(key, Buffer.concat(parts));
+  }
   for (const oid of plan.shallowLines) parts.push(pktLine(`shallow ${oid}\n`));
   for (const oid of plan.unshallowLines) parts.push(pktLine(`unshallow ${oid}\n`));
+  // The shallow block is flush-terminated: a real git client reads shallow lines
+  // until the flush and dies with "expected shallow/unshallow, got NAK" without it.
+  if (plan.shallowLines.length > 0 || plan.unshallowLines.length > 0) parts.push(PKT_FLUSH);
   parts.push(pktLine('NAK\n'));
   parts.push(...sidebandPackets(packFor(plan.send)));
   parts.push(PKT_FLUSH);

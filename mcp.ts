@@ -234,10 +234,30 @@ export function handleMcp(rawBody: Buffer): McpHttpResult {
   } catch {
     return { status: 400, body: rpcError(null, -32700, 'Parse error: the body is not JSON') };
   }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+  // A JSON-RPC batch: answer each request in order; notifications contribute no
+  // entry. An all-notification batch is answered like a single notification.
+  if (Array.isArray(parsed)) {
+    if (parsed.length === 0) return { status: 400, body: rpcError(null, -32600, 'Invalid request') };
+    const bodies: unknown[] = [];
+    for (const entry of parsed) {
+      if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+        bodies.push(rpcError(null, -32600, 'Invalid request'));
+        continue;
+      }
+      const result = handleOne(entry as Record<string, unknown>);
+      if (!result.empty) bodies.push(result.body);
+    }
+    if (bodies.length === 0) return { status: 202, body: null, empty: true };
+    return { status: 200, body: bodies };
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
     return { status: 400, body: rpcError(null, -32600, 'Invalid request') };
   }
-  const request = parsed as Record<string, unknown>;
+  return handleOne(parsed as Record<string, unknown>);
+}
+
+/** Handle a single JSON-RPC request object. */
+function handleOne(request: Record<string, unknown>): McpHttpResult {
   const method = typeof request.method === 'string' ? request.method : '';
   const id = request.id;
   const params = (typeof request.params === 'object' && request.params !== null ? request.params : {}) as Record<string, unknown>;

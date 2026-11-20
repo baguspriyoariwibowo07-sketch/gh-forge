@@ -525,10 +525,20 @@ function handleIssues(req: RestRequest, repo: RepoRec, sub: readonly string[]): 
       let issues = [...repo.issues.values()];
       if (state === 'open') issues = issues.filter((issue) => issue.state === 'open');
       else if (state === 'closed') issues = issues.filter((issue) => issue.state === 'closed');
+      // `?labels=a,b` keeps only issues carrying every named label.
+      const labelsParam = query.get('labels');
+      if (labelsParam !== null && labelsParam !== '') {
+        const wanted = labelsParam.split(',').map((name) => name.trim()).filter((name) => name !== '');
+        if (wanted.length > 0) issues = issues.filter((issue) => wanted.every((name) => issue.labels.includes(name)));
+      }
       const direction = query.get('direction') ?? 'desc';
       issues.sort((a, b) => (direction === 'asc' ? a.number - b.number : b.number - a.number));
       const page = pageOf(query);
-      return { status: 200, body: paginate(issues, page).map((issue) => issueJson(repo, issue)) };
+      return {
+        status: 200,
+        body: paginate(issues, page).map((issue) => issueJson(repo, issue)),
+        headers: linkHeader(req.host, `/api/v3/repos/${repo.owner}/${repo.name}/issues`, query, page, issues.length),
+      };
     }
     if (method === 'POST') {
       const title = stringField(req.body, 'title');
